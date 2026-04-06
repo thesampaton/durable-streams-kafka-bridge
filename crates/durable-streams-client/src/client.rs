@@ -62,8 +62,15 @@ impl DurableStreamsClient {
         })
     }
 
-    #[must_use]
-    pub fn stream(&self, path: impl Into<StreamPath>) -> DurableStream {
-        DurableStream::new(self.transport.clone(), path.into())
+    /// Create a typed handle for a specific stream path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` is not a valid absolute stream path.
+    pub fn stream(&self, path: impl AsRef<str>) -> Result<DurableStream> {
+        Ok(DurableStream::new(
+            self.transport.clone(),
+            StreamPath::new(path.as_ref())?,
+        ))
     }
 }

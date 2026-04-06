@@ -45,7 +45,7 @@ on top of.
 use durable_streams_client::{DurableStreamsClient, ReadMode, ReadRequest, SubscribeRequest};
 
 let client = DurableStreamsClient::new("http://localhost:4437")?;
-let stream = client.stream("/v1/stream/orders");
+let stream = client.stream("/v1/stream/orders")?;
 
 let metadata = stream.metadata().await?;
 

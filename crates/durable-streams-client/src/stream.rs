@@ -102,8 +102,8 @@ impl DurableStream {
         let stream = self.clone();
         Box::pin(async_stream::try_stream! {
             let mut offset = request.offset;
+            let path = stream.path.as_str().to_string();
             loop {
-                let path = stream.path.as_str().to_string();
                 let response = stream
                     .transport
                     .execute_with_retry("GET", &path, Method::GET, || {

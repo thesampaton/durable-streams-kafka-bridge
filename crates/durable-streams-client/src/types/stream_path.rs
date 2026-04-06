@@ -39,15 +39,19 @@ impl fmt::Display for StreamPath {
     }
 }
 
-impl From<&str> for StreamPath {
-    fn from(value: &str) -> Self {
-        Self::new(value).expect("stream path must start with `/`")
+impl TryFrom<&str> for StreamPath {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
     }
 }
 
-impl From<String> for StreamPath {
-    fn from(value: String) -> Self {
-        Self::new(value).expect("stream path must start with `/`")
+impl TryFrom<String> for StreamPath {
+    type Error = Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
     }
 }
 
