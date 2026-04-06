@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/durable-streams-client"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/thesampaton/durable-streams-kafka-bridge"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
