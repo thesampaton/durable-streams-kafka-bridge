@@ -76,6 +76,47 @@ async fn bridge_forwards_and_persists_checkpoint_offsets() {
     );
 }
 
+#[tokio::test]
+async fn bridge_combines_multiple_data_frames_before_checkpoint() {
+    let app = Router::new().route("/v1/stream/orders", get(multi_frame_handler));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = DurableStreamsClient::new(format!("http://{address}")).unwrap();
+    let store_path = std::env::temp_dir().join(format!(
+        "durable-streams-kafka-bridge-test-multiframe-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let offset_store = Arc::new(OffsetStore::open(&store_path).await.unwrap());
+    let sink = Arc::new(FakeSink::default());
+
+    run_stream(
+        client,
+        StreamRuntime {
+            path: "/v1/stream/orders".to_string(),
+            topic: "orders".to_string(),
+            start_offset: durable_streams_client::Offset::start(),
+        },
+        offset_store,
+        sink.clone(),
+    )
+    .await
+    .unwrap();
+
+    let sent = sink.sent.lock().await.clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].payload, b"hello world");
+    let _ = tokio::fs::remove_file(store_path).await;
+}
+
 async fn stream_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut rounds = state.rounds.lock().await;
     let response = if *rounds == 0 {
@@ -99,5 +140,20 @@ async fn stream_handler(State(state): State<AppState>) -> impl IntoResponse {
             (axum::http::header::CACHE_CONTROL, "no-cache"),
         ],
         response,
+    )
+}
+
+async fn multi_frame_handler() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        "event: data\n\
+         data: hello \n\n\
+         event: data\n\
+         data: world\n\n\
+         event: control\n\
+         data: {\"streamNextOffset\":\"o11\",\"upToDate\":true,\"streamClosed\":true}\n\n",
     )
 }

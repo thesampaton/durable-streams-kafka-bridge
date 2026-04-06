@@ -126,7 +126,7 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::BridgeConfig;
+    use super::{BridgeConfig, ConfigError};
 
     #[tokio::test]
     async fn config_defaults_offset_store_next_to_config() {
@@ -159,4 +159,34 @@ path = "/v1/stream/orders"
         );
     }
 
+    #[tokio::test]
+    async fn config_rejects_invalid_stream_paths() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "durable-streams-kafka-bridge-config-invalid-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("bridge.toml");
+        tokio::fs::write(
+            &path,
+            r#"
+[durable_streams]
+base_url = "http://localhost:4437"
+
+[kafka]
+bootstrap_servers = "localhost:9092"
+
+[[streams]]
+path = "v1/stream/orders"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let error = BridgeConfig::from_path(&path).await.unwrap_err();
+        match error {
+            ConfigError::Validation(message) => assert!(message.contains("invalid stream path")),
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
 }
