@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/durable-streams-client"]
+members = [
+    "crates/durable-streams-client",
+    "crates/durable-streams-kafka-bridge",
+]
 resolver = "2"
 
 [workspace.package]
