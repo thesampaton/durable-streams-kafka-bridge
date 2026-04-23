@@ -18,6 +18,8 @@ This crate demonstrates a deliberately lightweight application layer on top of
 - reads events in order
 - publishes them to Kafka with deterministic keys
 - stores the last acknowledged `next_offset` in a local JSON file
+- optionally watches a control stream to discover and forward new streams
+  dynamically
 
 ## What it does not do
 

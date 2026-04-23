@@ -2,13 +2,16 @@
 
 use crate::bridge::{BridgeError, StreamRuntime, run_stream};
 use crate::config::{BridgeConfig, ConfigError};
+use crate::discovery::{ActivePaths, run_discovery};
 use crate::kafka::KafkaSink;
 use crate::offset_store::{OffsetStore, OffsetStoreError};
 use clap::Parser;
 use durable_streams_client::DurableStreamsClient;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
@@ -46,7 +49,28 @@ impl App {
             &self.config.kafka.bootstrap_servers,
             &self.config.kafka.client_id,
             Duration::from_millis(self.config.kafka.delivery_timeout_ms),
+            self.config.kafka.auth.as_ref(),
         )?);
+        let runtimes: Vec<_> = self
+            .config
+            .streams
+            .iter()
+            .map(|stream| {
+                StreamRuntime::from_config(stream, &self.config.targets, &self.config.topic_mapping)
+            })
+            .collect();
+
+        if self.config.preflight.enabled {
+            run_preflight(
+                &client,
+                sink.as_ref(),
+                &runtimes,
+                Duration::from_millis(self.config.preflight.timeout_ms),
+                self.config.preflight.require_topics_exist,
+            )
+            .await?;
+        }
+
         let offset_store_path = self
             .config
             .offset_store
@@ -56,8 +80,15 @@ impl App {
         let offset_store = Arc::new(OffsetStore::open(offset_store_path).await?);
         let mut tasks = JoinSet::new();
 
-        for stream in &self.config.streams {
-            let runtime = StreamRuntime::from_config(stream);
+        // Seed active-paths set with static stream paths.
+        let active_paths: ActivePaths = Arc::new(Mutex::new(
+            runtimes
+                .iter()
+                .map(|r| r.path.clone())
+                .collect::<HashSet<_>>(),
+        ));
+
+        for runtime in runtimes {
             eprintln!(
                 "bridging {} -> {} (offset store: {})",
                 runtime.path,
@@ -72,22 +103,85 @@ impl App {
             ));
         }
 
+        // Wrap the JoinSet so discovery tasks can spawn new forwarders.
+        let shared_tasks = Arc::new(Mutex::new(tasks));
+
+        // Spawn one discovery task per [[discovery]] block.
+        // TODO: if a control stream is also a static stream, both subscriptions
+        // run independently — consider deduping in the future.
+        for discovery_config in self.config.discovery {
+            eprintln!(
+                "discovery: watching control stream {}",
+                discovery_config.control_stream
+            );
+            let client = client.clone();
+            let offset_store = offset_store.clone();
+            let sink = sink.clone();
+            let active_paths = active_paths.clone();
+            let shared_tasks_clone = shared_tasks.clone();
+            shared_tasks.lock().await.spawn(async move {
+                run_discovery(
+                    client,
+                    discovery_config,
+                    offset_store,
+                    sink,
+                    active_paths,
+                    shared_tasks_clone,
+                )
+                .await
+            });
+        }
+
         loop {
-            tokio::select! {
-                result = tasks.join_next(), if !tasks.is_empty() => match result {
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => return Err(AppError::Bridge(error)),
-                    Some(Err(error)) => return Err(AppError::Join(error)),
-                    None => return Ok(()),
-                },
-                signal = tokio::signal::ctrl_c() => {
-                    signal?;
-                    tasks.abort_all();
+            let result = {
+                let mut tasks = shared_tasks.lock().await;
+                if tasks.is_empty() {
                     return Ok(());
                 }
+                tokio::select! {
+                    result = tasks.join_next() => result,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        tasks.abort_all();
+                        return Ok(());
+                    }
+                }
+            };
+            match result {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(error))) => return Err(AppError::Bridge(error)),
+                Some(Err(error)) => return Err(AppError::Join(error)),
+                None => return Ok(()),
             }
         }
     }
+}
+
+async fn run_preflight(
+    client: &DurableStreamsClient,
+    sink: &KafkaSink,
+    runtimes: &[StreamRuntime],
+    timeout: Duration,
+    require_topics_exist: bool,
+) -> Result<(), AppError> {
+    for runtime in runtimes {
+        client
+            .stream(&runtime.path)?
+            .metadata()
+            .await
+            .map_err(|source| AppError::PreflightStream {
+                stream_path: runtime.path.clone(),
+                source,
+            })?;
+    }
+
+    let topics: Vec<_> = runtimes
+        .iter()
+        .map(|runtime| runtime.topic.clone())
+        .collect();
+    sink.preflight(&topics, timeout, require_topics_exist)
+        .map_err(AppError::PreflightKafka)?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +192,14 @@ pub enum AppError {
     Client(#[from] durable_streams_client::Error),
     #[error(transparent)]
     Kafka(#[from] crate::kafka::SinkError),
+    #[error("durable streams preflight failed for `{stream_path}`")]
+    PreflightStream {
+        stream_path: String,
+        #[source]
+        source: durable_streams_client::Error,
+    },
+    #[error("kafka preflight failed")]
+    PreflightKafka(#[source] crate::kafka::SinkError),
     #[error(transparent)]
     OffsetStore(#[from] OffsetStoreError),
     #[error(transparent)]

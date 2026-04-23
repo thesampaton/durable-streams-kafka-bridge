@@ -6,13 +6,52 @@ bootstrap_servers = "localhost:9092"
 client_id = "durable-streams-kafka-bridge"
 delivery_timeout_ms = 30000
 
+# Optional: env-backed SASL auth for managed Kafka.
+# [kafka.auth]
+# security_protocol = "SASL_SSL"
+# sasl_mechanism = "PLAIN"
+# username_env = "KAFKA_USERNAME"
+# password_env = "KAFKA_PASSWORD"
+# ssl_ca_location = "/path/to/ca.pem"
+
+[preflight]
+enabled = true
+timeout_ms = 5000
+require_topics_exist = true
+
+[targets.enterprise_documents]
+topic = "enterprise.documents"
+
+[topic_mapping]
+# Optional fallback: route any stream without `topic` or `target`
+# into one default Kafka topic.
+# default_topic = "enterprise.documents"
+
 [offset_store]
 path = ".durable-streams-kafka-bridge-offsets.json"
 
 [[streams]]
-path = "/v1/stream/orders"
-topic = "orders"
+path = "/v1/stream/docs/1"
+target = "enterprise_documents"
 offset = "start"
 
 [[streams]]
-path = "/v1/stream/payments"
+path = "/v1/stream/docs/2"
+target = "enterprise_documents"
+
+[[streams]]
+path = "/v1/stream/orders"
+topic = "orders"
+
+# Optional: dynamic stream discovery from a control stream.
+# The bridge watches the control stream for JSON events that announce new
+# streams, then spawns forwarders for them automatically.
+#
+# [[discovery]]
+# control_stream = "/v1/stream/admin/activity"
+# filter_field   = "kind"
+# filter_value   = "stream-created"
+# path_field     = "metadata.streamPath"
+# path_prefix    = "/v1/stream/"
+# default_offset = "start"
+# topic_template = "durable-streams.{path}"

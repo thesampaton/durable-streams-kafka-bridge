@@ -43,7 +43,10 @@ The default strategy is topic-per-stream:
 
 - `/v1/stream/orders` becomes `durable-streams.v1.stream.orders`
 - invalid Kafka topic characters are replaced with `-`
-- a stream can override the topic explicitly in config
+- named `targets` let multiple stream entries share one Kafka destination
+- a bridge-level `topic_mapping.default_topic` can send all configured streams
+  to one shared topic
+- a stream can still override the topic explicitly in config
 
 Kafka message keys are deterministic:
 
@@ -103,19 +106,179 @@ bootstrap_servers = "localhost:9092"
 client_id = "durable-streams-kafka-bridge"
 delivery_timeout_ms = 30000
 
+[kafka.auth]
+security_protocol = "SASL_SSL"
+sasl_mechanism = "PLAIN"
+username_env = "KAFKA_USERNAME"
+password_env = "KAFKA_PASSWORD"
+
+[preflight]
+enabled = true
+timeout_ms = 5000
+require_topics_exist = true
+
+[targets.enterprise_documents]
+topic = "enterprise.documents"
+
 [offset_store]
 path = ".durable-streams-kafka-bridge-offsets.json"
 
 [[streams]]
-path = "/v1/stream/orders"
-topic = "orders"
+path = "/v1/stream/docs/1"
+target = "enterprise_documents"
 offset = "start"
 
 [[streams]]
-path = "/v1/stream/payments"
+path = "/v1/stream/docs/2"
+target = "enterprise_documents"
+
+[[streams]]
+path = "/v1/stream/orders"
+topic = "orders"
 ```
 
 See `bridge.example.toml`.
+
+This keeps the config close to the real operational shape:
+
+- stream path = source
+- target name = destination intent
+- target topic = Kafka destination
+
+Topic precedence is:
+
+- `[[streams]].topic`
+- `[[streams]].target`
+- `topic_mapping.default_topic`
+- derived topic per stream
+
+## Dynamic discovery
+
+The bridge can watch a "control stream" whose JSON events announce new streams,
+and dynamically spawn forwarders for them at runtime. This is useful when the set
+of streams is not known ahead of time.
+
+```toml
+[[discovery]]
+control_stream = "/v1/stream/admin/activity"
+filter_field   = "kind"
+filter_value   = "stream-created"
+path_field     = "metadata.streamPath"
+path_prefix    = "/v1/stream/"
+default_offset = "start"
+topic_template = "durable-streams.{path}"
+```
+
+How it works:
+
+- on startup, static `[[streams]]` tasks launch as before
+- for each `[[discovery]]` block, a separate subscription watches the control
+  stream
+- on each checkpoint, the buffered payload is parsed as JSON
+- if `filter_field` / `filter_value` are set, only matching events proceed
+- the stream path is extracted via `path_field` (dotted JSON path), prepended
+  with `path_prefix` if set, and validated
+- if the path is new, a forwarder task is spawned; duplicates are skipped
+- topic naming uses `topic_template` (with `{path}` substitution and character
+  sanitization) or falls back to the default `durable-streams.<path>` convention
+- discovered streams persist offsets through the same `OffsetStore`; on restart,
+  re-reading the control stream re-discovers them and the forwarder resumes from
+  its last acknowledged offset
+- malformed JSON or missing fields are logged and skipped without crashing
+
+The `[[discovery]]` block is optional. Existing configs without it continue to
+work unchanged.
+
+## Managed Kafka auth
+
+The bridge now supports a small env-backed Kafka auth block:
+
+```toml
+[kafka.auth]
+security_protocol = "SASL_SSL"
+sasl_mechanism = "PLAIN"
+username_env = "KAFKA_USERNAME"
+password_env = "KAFKA_PASSWORD"
+```
+
+At startup, the bridge reads the named environment variables and applies them to
+the `rdkafka` producer as:
+
+- `security.protocol`
+- `sasl.mechanism`
+- `sasl.username`
+- `sasl.password`
+
+This keeps secrets out of the config file while staying simple for blog and demo
+use cases.
+
+### Confluent Cloud
+
+For Confluent Cloud, use your Kafka API key and secret:
+
+```bash
+export KAFKA_USERNAME="<confluent-api-key>"
+export KAFKA_PASSWORD="<confluent-api-secret>"
+```
+
+The bridge config can stay on `SASL_SSL` + `PLAIN`.
+
+### Google Cloud Managed Kafka
+
+For Google Cloud Managed Service for Apache Kafka, this bridge can use the same
+`SASL_SSL` + `PLAIN` shape for simple testing and blog demos, with a principal
+in `KAFKA_USERNAME` and a short-lived token or other provider-issued secret in
+`KAFKA_PASSWORD`.
+
+Example:
+
+```bash
+export KAFKA_USERNAME="<managed-kafka-principal>"
+export KAFKA_PASSWORD="$(gcloud auth print-access-token)"
+```
+
+Important limitation:
+
+- the bridge reads auth env vars once at startup
+- it does not refresh short-lived tokens automatically
+- for long-running production use with expiring credentials, a future
+  `OAUTHBEARER` flow or an external restart/rotation mechanism is the better fit
+
+That limitation is intentional for this version of the bridge. The goal here is
+to document and demonstrate the pattern, not to build a full auth subsystem.
+
+## Preflight checks
+
+Before the bridge starts forwarding, it can perform a small operational
+preflight:
+
+- resolve Kafka auth env vars
+- verify each configured Durable Stream is reachable via a metadata request
+- verify the Kafka cluster is reachable
+- optionally verify that each resolved Kafka topic already exists
+
+Configuration:
+
+```toml
+[preflight]
+enabled = true
+timeout_ms = 5000
+require_topics_exist = true
+```
+
+This is intentionally a readiness check, not a reconciliation system:
+
+- it does not create topics
+- it does not retry forever during startup
+- it does not validate every downstream policy
+- it fails fast before the bridge enters the forwarding loop
+
+For the blog and demo shape, this gives a cleaner operational model:
+
+- define sources
+- define destinations
+- validate the bridge can reach both sides
+- then start forwarding with lightweight local offset state
 
 ## Running locally
 
