@@ -1,12 +1,13 @@
-use crate::config::StreamConfig;
+use crate::config::{StreamConfig, TargetConfig, TopicMappingConfig};
 use crate::kafka::{BridgeRecord, RecordSink, SinkError};
 use crate::offset_store::{OffsetStore, OffsetStoreError};
-use crate::topic::{message_key, resolve_topic};
+use crate::topic::{TopicResolutionContext, message_key, resolve_topic};
 use durable_streams_client::{
     DurableStreamsClient, Error as ClientError, Offset, StreamCheckpoint, SubscribeRequest,
     SubscriptionEvent,
 };
 use futures_util::StreamExt;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -18,10 +19,22 @@ pub struct StreamRuntime {
 
 impl StreamRuntime {
     #[must_use]
-    pub fn from_config(config: &StreamConfig) -> Self {
+    pub fn from_config(
+        config: &StreamConfig,
+        targets: &BTreeMap<String, TargetConfig>,
+        topic_mapping: &TopicMappingConfig,
+    ) -> Self {
         Self {
             path: config.path.clone(),
-            topic: resolve_topic(&config.path, config.topic.as_deref()),
+            topic: resolve_topic(
+                &config.path,
+                &TopicResolutionContext {
+                    explicit_topic: config.topic.as_deref(),
+                    target: config.target.as_deref(),
+                    targets,
+                    topic_mapping,
+                },
+            ),
             start_offset: config.start_offset(),
         }
     }
@@ -117,10 +130,12 @@ pub enum BridgeError {
 #[cfg(test)]
 mod tests {
     use super::{StreamRuntime, handle_checkpoint};
+    use crate::config::{StreamConfig, TargetConfig, TopicMappingConfig};
     use crate::kafka::{BridgeRecord, RecordSink, SinkError};
     use crate::offset_store::OffsetStore;
     use async_trait::async_trait;
     use durable_streams_client::{Offset, StreamCheckpoint};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -178,5 +193,44 @@ mod tests {
             Some(Offset::from("o9"))
         );
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[test]
+    fn stream_runtime_uses_bridge_level_default_topic() {
+        let runtime = StreamRuntime::from_config(
+            &StreamConfig {
+                path: "/v1/stream/docs/1".to_string(),
+                topic: None,
+                target: None,
+                offset: None,
+            },
+            &BTreeMap::new(),
+            &TopicMappingConfig {
+                default_topic: Some("enterprise.documents".to_string()),
+            },
+        );
+
+        assert_eq!(runtime.topic, "enterprise.documents");
+    }
+
+    #[test]
+    fn stream_runtime_uses_named_target_topic() {
+        let runtime = StreamRuntime::from_config(
+            &StreamConfig {
+                path: "/v1/stream/docs/1".to_string(),
+                topic: None,
+                target: Some("enterprise_documents".to_string()),
+                offset: None,
+            },
+            &BTreeMap::from([(
+                "enterprise_documents".to_string(),
+                TargetConfig {
+                    topic: "enterprise.documents".to_string(),
+                },
+            )]),
+            &TopicMappingConfig::default(),
+        );
+
+        assert_eq!(runtime.topic, "enterprise.documents");
     }
 }
