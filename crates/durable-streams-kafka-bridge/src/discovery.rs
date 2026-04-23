@@ -84,7 +84,7 @@ async fn process_discovery_event<S>(
 ) where
     S: RecordSink + 'static,
 {
-    let value: serde_json::Value = match serde_json::from_slice(payload) {
+    let root: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("discovery: failed to parse JSON from control stream: {err}");
@@ -92,9 +92,39 @@ async fn process_discovery_event<S>(
         }
     };
 
+    let events: Vec<&serde_json::Value> = match &root {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+
+    for event in events {
+        process_single_event(
+            event,
+            config,
+            client,
+            offset_store,
+            sink,
+            active_paths,
+            spawner,
+        )
+        .await;
+    }
+}
+
+async fn process_single_event<S>(
+    value: &serde_json::Value,
+    config: &DiscoveryConfig,
+    client: &DurableStreamsClient,
+    offset_store: &Arc<OffsetStore>,
+    sink: &Arc<S>,
+    active_paths: &ActivePaths,
+    spawner: &Spawner,
+) where
+    S: RecordSink + 'static,
+{
     // Apply filter if configured.
     if let (Some(field), Some(expected)) = (&config.filter_field, &config.filter_value) {
-        match get_dotted(&value, field) {
+        match get_dotted(value, field) {
             Some(serde_json::Value::String(actual)) if actual == expected => {}
             _ => return,
         }
@@ -102,7 +132,7 @@ async fn process_discovery_event<S>(
 
     // Extract the stream path.
     let extracted =
-        if let Some(serde_json::Value::String(s)) = get_dotted(&value, &config.path_field) {
+        if let Some(serde_json::Value::String(s)) = get_dotted(value, &config.path_field) {
             s.clone()
         } else {
             eprintln!(
@@ -180,9 +210,42 @@ fn get_dotted<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_
     path.split('.').try_fold(value, |acc, seg| acc.get(seg))
 }
 
+/// Extract resolved stream paths from a raw payload, applying the same JSON
+/// parsing, array fan-out, filter, and path resolution as discovery. Useful for
+/// testing without a full client/sink/spawner stack.
+#[cfg(test)]
+fn extract_paths_from_payload(payload: &[u8], config: &DiscoveryConfig) -> Vec<String> {
+    let root: serde_json::Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let events: Vec<&serde_json::Value> = match &root {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+
+    let mut paths = Vec::new();
+    for event in events {
+        if let (Some(field), Some(expected)) = (&config.filter_field, &config.filter_value) {
+            match get_dotted(event, field) {
+                Some(serde_json::Value::String(actual)) if actual == expected => {}
+                _ => continue,
+            }
+        }
+        if let Some(serde_json::Value::String(s)) = get_dotted(event, &config.path_field) {
+            paths.push(resolve_discovered_path(s, config.path_prefix.as_deref()));
+        }
+    }
+    paths
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{get_dotted, resolve_discovered_path, sanitize_topic, topic_for_discovered_stream};
+    use super::{
+        extract_paths_from_payload, get_dotted, resolve_discovered_path, sanitize_topic,
+        topic_for_discovered_stream,
+    };
     use crate::config::DiscoveryConfig;
     use serde_json::json;
 
@@ -323,5 +386,55 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_ok());
+    }
+
+    // --- JSON array fan-out tests ---
+
+    fn array_test_config() -> DiscoveryConfig {
+        toml::from_str(
+            r#"
+            control_stream = "/v1/stream/admin/activity"
+            filter_field = "resourceType"
+            filter_value = "deck"
+            path_field = "metadata.streamPath"
+            path_prefix = "/v1/stream/"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn array_payload_with_matching_event_spawns() {
+        let config = array_test_config();
+        let payload = br#"[{"resourceType":"deck","metadata":{"streamPath":"slides/abc"}}]"#;
+        let paths = extract_paths_from_payload(payload, &config);
+        assert_eq!(paths, vec!["/v1/stream/slides/abc"]);
+    }
+
+    #[test]
+    fn array_payload_with_mixed_events_spawns_only_matches() {
+        let config = array_test_config();
+        let payload = br#"[
+            {"resourceType":"deck","metadata":{"streamPath":"slides/abc"}},
+            {"resourceType":"document","metadata":{"streamPath":"docs/xyz"}}
+        ]"#;
+        let paths = extract_paths_from_payload(payload, &config);
+        assert_eq!(paths, vec!["/v1/stream/slides/abc"]);
+    }
+
+    #[test]
+    fn object_payload_still_works() {
+        let config = array_test_config();
+        let payload = br#"{"resourceType":"deck","metadata":{"streamPath":"slides/abc"}}"#;
+        let paths = extract_paths_from_payload(payload, &config);
+        assert_eq!(paths, vec!["/v1/stream/slides/abc"]);
+    }
+
+    #[test]
+    fn empty_array_is_noop() {
+        let config = array_test_config();
+        let payload = b"[]";
+        let paths = extract_paths_from_payload(payload, &config);
+        assert!(paths.is_empty());
     }
 }
