@@ -106,6 +106,12 @@ impl BridgeConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct DurableStreamsConfig {
     pub base_url: String,
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+}
+
+fn default_request_timeout_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

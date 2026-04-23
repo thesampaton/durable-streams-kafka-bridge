@@ -280,6 +280,24 @@ For the blog and demo shape, this gives a cleaner operational model:
 - validate the bridge can reach both sides
 - then start forwarding with lightweight local offset state
 
+## Operational notes
+
+The `request_timeout_ms` setting (default 30s) applies only to bounded calls
+(metadata HEAD, catch-up/long-poll GET). It does **not** apply to SSE
+subscriptions, which are long-lived streaming bodies. Applying a total-request
+deadline to SSE would kill any subscription that idles longer than the timeout.
+
+Dead SSE connections are instead detected at the TCP layer via a 30-second
+keepalive interval on the underlying `reqwest` client.
+
+You can tune the timeout in the bridge config:
+
+```toml
+[durable_streams]
+base_url = "http://localhost:4437"
+request_timeout_ms = 30000
+```
+
 ## Running locally
 
 Start Kafka:

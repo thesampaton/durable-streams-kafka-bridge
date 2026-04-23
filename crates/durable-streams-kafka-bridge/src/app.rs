@@ -6,7 +6,7 @@ use crate::discovery::{ActivePaths, run_discovery};
 use crate::kafka::KafkaSink;
 use crate::offset_store::{OffsetStore, OffsetStoreError};
 use clap::Parser;
-use durable_streams_client::DurableStreamsClient;
+use durable_streams_client::{ClientConfig, DurableStreamsClient};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +44,15 @@ impl App {
     /// Returns an error when startup fails or when any stream task exits with
     /// an error.
     pub async fn run(self) -> Result<(), AppError> {
-        let client = DurableStreamsClient::new(&self.config.durable_streams.base_url)?;
+        let client = DurableStreamsClient::with_config(
+            &self.config.durable_streams.base_url,
+            ClientConfig {
+                request_timeout: Duration::from_millis(
+                    self.config.durable_streams.request_timeout_ms,
+                ),
+                ..ClientConfig::default()
+            },
+        )?;
         let sink = Arc::new(KafkaSink::new(
             &self.config.kafka.bootstrap_servers,
             &self.config.kafka.client_id,

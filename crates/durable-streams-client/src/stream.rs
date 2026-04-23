@@ -39,7 +39,7 @@ impl DurableStream {
         let response = self
             .transport
             .execute_with_retry("HEAD", &path, Method::HEAD, || {
-                self.transport.request(Method::HEAD, &path)
+                self.transport.bounded_request(Method::HEAD, &path)
             })
             .await?;
         let headers = response.headers();
@@ -62,7 +62,7 @@ impl DurableStream {
         let response = self
             .transport
             .execute_with_retry("GET", &path, Method::GET, || {
-                let mut builder = self.transport.request(Method::GET, &path)?;
+                let mut builder = self.transport.bounded_request(Method::GET, &path)?;
                 builder = builder.query(&[("offset", request.offset.as_str())]);
                 if request.mode == ReadMode::LongPoll {
                     builder = builder.query(&[("live", "long-poll")]);

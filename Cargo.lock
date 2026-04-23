@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "durable-streams-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "durable-streams-kafka-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",

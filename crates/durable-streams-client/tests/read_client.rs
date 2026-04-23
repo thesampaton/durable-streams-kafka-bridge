@@ -7,8 +7,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use durable_streams_client::{
-    DurableStreamsClient, Error, ErrorKind, Offset, ReadMode, ReadRequest, StreamPath,
-    SubscribeRequest, SubscriptionEvent,
+    ClientConfig, DurableStreamsClient, Error, ErrorKind, Offset, ReadMode, ReadRequest,
+    StreamPath, SubscribeRequest, SubscriptionEvent,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -520,4 +520,116 @@ fn offset_for(len: usize) -> String {
 
 fn header_value(value: impl AsRef<str>) -> HeaderValue {
     HeaderValue::from_str(value.as_ref()).unwrap()
+}
+
+// ── Timeout regression tests ──────────────────────────────────────────────
+
+/// Reproduces the SSE timeout bug: a subscribe body that idles longer than
+/// `request_timeout` must NOT be killed. The client-wide timeout has been
+/// removed; only bounded calls (metadata, read) honour it.
+#[tokio::test]
+async fn subscribe_survives_idle_longer_than_request_timeout() {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let gate = Arc::new(Notify::new());
+    let gate_clone = gate.clone();
+
+    let app = Router::new().route(
+        "/v1/stream/{*path}",
+        get(move |Query(q): Query<ReadQuery>| {
+            let gate = gate_clone.clone();
+            async move {
+                if q.live.as_deref() == Some("sse") {
+                    // Wait for the test to signal us — simulates a long idle.
+                    gate.notified().await;
+                    return (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/event-stream",
+                        )],
+                        "event: data\n\
+                         data: delayed-hello\n\n\
+                         event: control\n\
+                         data: {\"streamNextOffset\":\"o5\",\"upToDate\":true,\"streamClosed\":true}\n\n",
+                    )
+                        .into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Very short request_timeout — subscribe must NOT honour it.
+    let client = DurableStreamsClient::with_config(
+        format!("http://{address}"),
+        ClientConfig {
+            request_timeout: Duration::from_secs(1),
+            ..ClientConfig::default()
+        },
+    )
+    .unwrap();
+    let stream = client.stream("/v1/stream/idle-test").unwrap();
+    let mut subscription = stream.subscribe(SubscribeRequest::default());
+
+    // Wait well past the request_timeout before emitting the first event.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    gate.notify_one();
+
+    let first = subscription.next().await.unwrap().unwrap();
+    assert_eq!(
+        first,
+        SubscriptionEvent::Data(Bytes::from_static(b"delayed-hello"))
+    );
+}
+
+/// Bounded calls (metadata) must still honour `request_timeout`.
+#[tokio::test]
+async fn metadata_honours_request_timeout() {
+    use std::time::Duration;
+
+    let app = Router::new().route(
+        "/v1/stream/{*path}",
+        get(|| async { StatusCode::NOT_FOUND.into_response() }).head(|| async {
+            // Delay longer than the configured timeout.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            StatusCode::OK.into_response()
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = DurableStreamsClient::with_config(
+        format!("http://{address}"),
+        ClientConfig {
+            request_timeout: Duration::from_secs(1),
+            // Disable retries so we don't wait through multiple attempts.
+            retry_policy: durable_streams_client::RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            ..ClientConfig::default()
+        },
+    )
+    .unwrap();
+    let stream = client.stream("/v1/stream/timeout-test").unwrap();
+
+    let started = tokio::time::Instant::now();
+    let error = stream.metadata().await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "should have timed out quickly, took {elapsed:?}"
+    );
+    match error {
+        Error::Transport { .. } => {}
+        other => panic!("expected transport error, got {other:?}"),
+    }
 }

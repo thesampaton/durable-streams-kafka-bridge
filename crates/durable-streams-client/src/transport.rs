@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::protocol::headers;
 use crate::retry::RetryPolicy;
 use reqwest::{Method, RequestBuilder, Response, Url};
+use std::time::Duration;
 use tokio::time::sleep;
 
 #[derive(Debug)]
@@ -10,11 +11,12 @@ pub struct HttpTransport {
     base_url: Url,
     client: reqwest::Client,
     retry_policy: RetryPolicy,
+    request_timeout: Duration,
 }
 
 impl HttpTransport {
     pub fn new(base_url: Url, config: ClientConfig) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().timeout(config.request_timeout);
+        let mut builder = reqwest::Client::builder().tcp_keepalive(Duration::from_secs(30));
         if let Some(user_agent) = config.user_agent {
             builder = builder.user_agent(user_agent);
         }
@@ -27,6 +29,7 @@ impl HttpTransport {
             base_url,
             client,
             retry_policy: config.retry_policy,
+            request_timeout: config.request_timeout,
         })
     }
 
@@ -42,6 +45,10 @@ impl HttpTransport {
     pub fn request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
         let url = self.url_for(path)?;
         Ok(self.client.request(method, url))
+    }
+
+    pub fn bounded_request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
+        Ok(self.request(method, path)?.timeout(self.request_timeout))
     }
 
     pub async fn execute_with_retry(

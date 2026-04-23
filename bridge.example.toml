@@ -1,5 +1,6 @@
 [durable_streams]
 base_url = "http://localhost:4437"
+# request_timeout_ms = 30000  # applied to HEAD/GET only, not SSE subscriptions
 
 [kafka]
 bootstrap_servers = "localhost:9092"

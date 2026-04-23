@@ -67,6 +67,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Timeout behaviour
+
+`ClientConfig::request_timeout` (default 30s) is applied per-request to bounded
+calls (`metadata`, `read`) but intentionally **not** to `subscribe`. SSE
+subscriptions are long-lived streaming bodies that will always exceed a total
+request deadline during idle periods. Dead connections are detected at the TCP
+layer via a 30-second keepalive interval instead.
+
 ## Conformance notes
 
 The published upstream `@durable-streams/client-conformance-tests` package is
