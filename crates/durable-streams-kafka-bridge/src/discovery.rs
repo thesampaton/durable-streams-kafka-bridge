@@ -8,11 +8,14 @@ use durable_streams_client::{
 };
 use futures_util::StreamExt;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::task::JoinSet;
 
 pub type ActivePaths = Arc<Mutex<HashSet<String>>>;
+pub type SpawnRequest = Pin<Box<dyn Future<Output = Result<(), BridgeError>> + Send>>;
+pub type Spawner = tokio::sync::mpsc::UnboundedSender<SpawnRequest>;
 
 /// Run a discovery loop that watches a control stream and dynamically spawns
 /// forwarders for newly discovered stream paths.
@@ -27,7 +30,7 @@ pub async fn run_discovery<S>(
     offset_store: Arc<OffsetStore>,
     sink: Arc<S>,
     active_paths: ActivePaths,
-    tasks: Arc<Mutex<JoinSet<Result<(), BridgeError>>>>,
+    spawner: Spawner,
 ) -> Result<(), BridgeError>
 where
     S: RecordSink + 'static,
@@ -55,7 +58,7 @@ where
                         &offset_store,
                         &sink,
                         &active_paths,
-                        &tasks,
+                        &spawner,
                     )
                     .await;
                 }
@@ -77,7 +80,7 @@ async fn process_discovery_event<S>(
     offset_store: &Arc<OffsetStore>,
     sink: &Arc<S>,
     active_paths: &ActivePaths,
-    tasks: &Arc<Mutex<JoinSet<Result<(), BridgeError>>>>,
+    spawner: &Spawner,
 ) where
     S: RecordSink + 'static,
 {
@@ -137,10 +140,7 @@ async fn process_discovery_event<S>(
     let client = client.clone();
     let offset_store = offset_store.clone();
     let sink = sink.clone();
-    tasks
-        .lock()
-        .await
-        .spawn(run_stream(client, runtime, offset_store, sink));
+    let _ = spawner.send(Box::pin(run_stream(client, runtime, offset_store, sink)));
 }
 
 #[must_use]

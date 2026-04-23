@@ -5,7 +5,7 @@ use axum::routing::get;
 use durable_streams_client::DurableStreamsClient;
 use durable_streams_kafka_bridge::bridge::BridgeError;
 use durable_streams_kafka_bridge::config::DiscoveryConfig;
-use durable_streams_kafka_bridge::discovery::{ActivePaths, run_discovery};
+use durable_streams_kafka_bridge::discovery::{ActivePaths, SpawnRequest, run_discovery};
 use durable_streams_kafka_bridge::kafka::{BridgeRecord, RecordSink, SinkError};
 use durable_streams_kafka_bridge::offset_store::OffsetStore;
 use std::collections::HashSet;
@@ -47,6 +47,37 @@ fn sse_response(body: &'static str) -> impl IntoResponse {
         ],
         body,
     )
+}
+
+/// Run discovery and drain all spawned forwarder tasks to completion.
+async fn run_discovery_to_completion<S: RecordSink + 'static>(
+    client: DurableStreamsClient,
+    config: DiscoveryConfig,
+    offset_store: Arc<OffsetStore>,
+    sink: Arc<S>,
+    active_paths: ActivePaths,
+) {
+    let (spawn_tx, mut spawn_rx) = tokio::sync::mpsc::unbounded_channel::<SpawnRequest>();
+    let mut tasks: JoinSet<Result<(), BridgeError>> = JoinSet::new();
+
+    tasks.spawn(async move {
+        run_discovery(client, config, offset_store, sink, active_paths, spawn_tx).await
+    });
+
+    loop {
+        tokio::select! {
+            Some(fut) = spawn_rx.recv() => {
+                tasks.spawn(async move { fut.await });
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => match result {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => panic!("task failed: {e}"),
+                Some(Err(e)) => panic!("join error: {e}"),
+                None => return,
+            },
+            else => return,
+        }
+    }
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────
@@ -139,27 +170,17 @@ async fn discovery_spawns_forwarders_for_created_streams() {
     let offset_store = Arc::new(OffsetStore::open(&store_path).await.unwrap());
     let sink = Arc::new(FakeSink::default());
     let active_paths: ActivePaths = Arc::new(Mutex::new(HashSet::new()));
-    let tasks: Arc<Mutex<JoinSet<Result<(), BridgeError>>>> = Arc::new(Mutex::new(JoinSet::new()));
 
     let config = discovery_config("/v1/stream/admin/activity");
 
-    run_discovery(
+    run_discovery_to_completion(
         client,
         config,
         offset_store.clone(),
         sink.clone(),
         active_paths.clone(),
-        tasks.clone(),
     )
-    .await
-    .unwrap();
-
-    // Wait for spawned forwarder tasks to complete.
-    let mut tasks_guard = tasks.lock().await;
-    while let Some(result) = tasks_guard.join_next().await {
-        result.unwrap().unwrap();
-    }
-    drop(tasks_guard);
+    .await;
 
     let sent = sink.sent.lock().await.clone();
     let topics: HashSet<_> = sent.iter().map(|r| r.topic.clone()).collect();
@@ -207,7 +228,6 @@ async fn discovery_ignores_filtered_events() {
     let offset_store = Arc::new(OffsetStore::open(&store_path).await.unwrap());
     let sink = Arc::new(FakeSink::default());
     let active_paths: ActivePaths = Arc::new(Mutex::new(HashSet::new()));
-    let tasks: Arc<Mutex<JoinSet<Result<(), BridgeError>>>> = Arc::new(Mutex::new(JoinSet::new()));
 
     // Use a filter_value that matches nothing.
     let config: DiscoveryConfig = toml::from_str(
@@ -221,16 +241,7 @@ async fn discovery_ignores_filtered_events() {
     )
     .unwrap();
 
-    run_discovery(
-        client,
-        config,
-        offset_store,
-        sink,
-        active_paths.clone(),
-        tasks.clone(),
-    )
-    .await
-    .unwrap();
+    run_discovery_to_completion(client, config, offset_store, sink, active_paths.clone()).await;
 
     let paths = active_paths.lock().await;
     assert!(paths.is_empty(), "no streams should have been discovered");
@@ -256,27 +267,10 @@ async fn discovery_deduplicates_same_path() {
     let offset_store = Arc::new(OffsetStore::open(&store_path).await.unwrap());
     let sink = Arc::new(FakeSink::default());
     let active_paths: ActivePaths = Arc::new(Mutex::new(HashSet::new()));
-    let tasks: Arc<Mutex<JoinSet<Result<(), BridgeError>>>> = Arc::new(Mutex::new(JoinSet::new()));
 
     let config = discovery_config("/v1/stream/admin/activity");
 
-    run_discovery(
-        client,
-        config,
-        offset_store,
-        sink.clone(),
-        active_paths,
-        tasks.clone(),
-    )
-    .await
-    .unwrap();
-
-    // Wait for spawned tasks.
-    let mut tasks_guard = tasks.lock().await;
-    while let Some(result) = tasks_guard.join_next().await {
-        result.unwrap().unwrap();
-    }
-    drop(tasks_guard);
+    run_discovery_to_completion(client, config, offset_store, sink.clone(), active_paths).await;
 
     // Only one record should be sent despite two stream-created for same path.
     let sent = sink.sent.lock().await.clone();
@@ -312,28 +306,11 @@ async fn discovery_skips_malformed_json_without_crashing() {
     let offset_store = Arc::new(OffsetStore::open(&store_path).await.unwrap());
     let sink = Arc::new(FakeSink::default());
     let active_paths: ActivePaths = Arc::new(Mutex::new(HashSet::new()));
-    let tasks: Arc<Mutex<JoinSet<Result<(), BridgeError>>>> = Arc::new(Mutex::new(JoinSet::new()));
 
     let config = discovery_config("/v1/stream/admin/activity");
 
     // Should not panic or return error despite malformed first event.
-    run_discovery(
-        client,
-        config,
-        offset_store,
-        sink.clone(),
-        active_paths,
-        tasks.clone(),
-    )
-    .await
-    .unwrap();
-
-    // Wait for spawned tasks.
-    let mut tasks_guard = tasks.lock().await;
-    while let Some(result) = tasks_guard.join_next().await {
-        result.unwrap().unwrap();
-    }
-    drop(tasks_guard);
+    run_discovery_to_completion(client, config, offset_store, sink.clone(), active_paths).await;
 
     // The valid event after the malformed one should still be processed.
     let sent = sink.sent.lock().await.clone();

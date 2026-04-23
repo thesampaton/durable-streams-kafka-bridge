@@ -2,7 +2,7 @@
 
 use crate::bridge::{BridgeError, StreamRuntime, run_stream};
 use crate::config::{BridgeConfig, ConfigError};
-use crate::discovery::{ActivePaths, run_discovery};
+use crate::discovery::{ActivePaths, SpawnRequest, run_discovery};
 use crate::kafka::KafkaSink;
 use crate::offset_store::{OffsetStore, OffsetStoreError};
 use clap::Parser;
@@ -86,7 +86,8 @@ impl App {
             .clone()
             .ok_or_else(|| AppError::MissingOffsetStorePath)?;
         let offset_store = Arc::new(OffsetStore::open(offset_store_path).await?);
-        let mut tasks = JoinSet::new();
+        let mut tasks: JoinSet<Result<(), BridgeError>> = JoinSet::new();
+        let (spawn_tx, mut spawn_rx) = tokio::sync::mpsc::unbounded_channel::<SpawnRequest>();
 
         // Seed active-paths set with static stream paths.
         let active_paths: ActivePaths = Arc::new(Mutex::new(
@@ -111,9 +112,6 @@ impl App {
             ));
         }
 
-        // Wrap the JoinSet so discovery tasks can spawn new forwarders.
-        let shared_tasks = Arc::new(Mutex::new(tasks));
-
         // Spawn one discovery task per [[discovery]] block.
         // TODO: if a control stream is also a static stream, both subscriptions
         // run independently — consider deduping in the future.
@@ -126,40 +124,41 @@ impl App {
             let offset_store = offset_store.clone();
             let sink = sink.clone();
             let active_paths = active_paths.clone();
-            let shared_tasks_clone = shared_tasks.clone();
-            shared_tasks.lock().await.spawn(async move {
+            let spawner = spawn_tx.clone();
+            tasks.spawn(async move {
                 run_discovery(
                     client,
                     discovery_config,
                     offset_store,
                     sink,
                     active_paths,
-                    shared_tasks_clone,
+                    spawner,
                 )
                 .await
             });
         }
 
+        // Drop the main-loop's own sender so the channel closes naturally
+        // when all discovery tasks exit.
+        drop(spawn_tx);
+
         loop {
-            let result = {
-                let mut tasks = shared_tasks.lock().await;
-                if tasks.is_empty() {
+            tokio::select! {
+                Some(fut) = spawn_rx.recv() => {
+                    tasks.spawn(async move { fut.await });
+                }
+                result = tasks.join_next(), if !tasks.is_empty() => match result {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => return Err(AppError::Bridge(error)),
+                    Some(Err(error)) => return Err(AppError::Join(error)),
+                    None => return Ok(()),
+                },
+                signal = tokio::signal::ctrl_c() => {
+                    signal?;
+                    tasks.abort_all();
                     return Ok(());
                 }
-                tokio::select! {
-                    result = tasks.join_next() => result,
-                    signal = tokio::signal::ctrl_c() => {
-                        signal?;
-                        tasks.abort_all();
-                        return Ok(());
-                    }
-                }
-            };
-            match result {
-                Some(Ok(Ok(()))) => {}
-                Some(Ok(Err(error))) => return Err(AppError::Bridge(error)),
-                Some(Err(error)) => return Err(AppError::Join(error)),
-                None => return Ok(()),
+                else => return Ok(()),
             }
         }
     }
